@@ -10,7 +10,7 @@ Based on [OpenTrickler-RP2040-Controller](https://github.com/eamars/OpenTrickler
 
 | Board | SoC | Status |
 |---|---|---|
-| Raspberry Pi Pico W | RP2040 | Tested |
+| Raspberry Pi Pico W | RP2040 | NOT Tested |
 
 ## Features
 
