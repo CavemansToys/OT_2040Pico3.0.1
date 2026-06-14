@@ -1,0 +1,528 @@
+#include <string.h>
+#include <stdio.h>
+#include <FreeRTOS.h>
+#include <semphr.h>
+
+#include "profile.h"
+#include "eeprom.h"
+#include "common.h"
+#include "error.h"
+
+
+eeprom_profile_data_t profile_data;
+
+// Mutex to protect PID parameter access (prevents race between REST writes and motor control reads)
+static SemaphoreHandle_t g_profile_pid_mutex = NULL;
+
+extern void swuart_calcCRC(uint8_t* datagram, uint8_t datagramLength);
+
+
+const profile_t default_ar_2208_profile = {
+    .rev = 0,
+    .compatibility = 0,
+
+    .name = "AR2208,gr",
+
+    .coarse_kp = 1.0f,
+    .coarse_ki = 0.0f,
+    .coarse_kd = 2.0f,
+    .coarse_min_flow_speed_rps = 0.1f,
+    .coarse_max_flow_speed_rps = 5.0f,
+
+    .fine_kp = 5.0f,
+    .fine_ki = 0.0f,
+    .fine_kd = 20.0f,
+    .fine_min_flow_speed_rps = 0.1f,
+    .fine_max_flow_speed_rps = 5.0f,
+};
+
+
+const profile_t default_ar_2209_profile = {
+    .rev = 0,
+    .compatibility = 0,
+
+    .name = "AR2209,gr",
+
+    .coarse_kp = 1.0f,
+    .coarse_ki = 0.0f,
+    .coarse_kd = 2.0f,
+    .coarse_min_flow_speed_rps = 0.1f,
+    .coarse_max_flow_speed_rps = 5.0f,
+
+    .fine_kp = 5.0f,
+    .fine_ki = 0.0f,
+    .fine_kd = 20.0f,
+
+    .fine_min_flow_speed_rps = 0.08f,
+    .fine_max_flow_speed_rps = 5.0f,
+};
+
+
+const profile_t default_8208xbr_profile = {
+    .rev = 0,
+    .compatibility = 0,
+
+    .name = "8208XBR,gr",
+
+    .coarse_kp = 1.0f,
+    .coarse_ki = 0.0f,
+    .coarse_kd = 2.0f,
+    .coarse_min_flow_speed_rps = 0.1f,
+    .coarse_max_flow_speed_rps = 5.0f,
+
+    .fine_kp = 5.0f,
+    .fine_ki = 0.0f,
+    .fine_kd = 20.0f,
+
+    .fine_min_flow_speed_rps = 0.06f,
+    .fine_max_flow_speed_rps = 5.0f,
+};
+
+
+const profile_t default_benchmark2_profile = {
+    .rev = 0,
+    .compatibility = 0,
+
+    .name = "Benchmark2,gr",
+
+    .coarse_kp = 1.0f,
+    .coarse_ki = 0.0f,
+    .coarse_kd = 2.0f,
+    .coarse_min_flow_speed_rps = 0.1f,
+    .coarse_max_flow_speed_rps = 5.0f,
+
+    .fine_kp = 5.0f,
+    .fine_ki = 0.0f,
+    .fine_kd = 20.0f,
+
+    .fine_min_flow_speed_rps = 0.08f,
+    .fine_max_flow_speed_rps = 5.0f,
+};
+
+
+static const profile_t default_generic_profile = {
+    .rev = 0,
+    .compatibility = 0,
+
+    .name = "NewProfile",
+
+    .coarse_kp = 1.0f,
+    .coarse_ki = 0.0f,
+    .coarse_kd = 2.0f,
+    .coarse_min_flow_speed_rps = 0.1f,
+    .coarse_max_flow_speed_rps = 5.0f,
+
+    .fine_kp = 5.0f,
+    .fine_ki = 0.0f,
+    .fine_kd = 20.0f,
+    .fine_min_flow_speed_rps = 0.1f,
+    .fine_max_flow_speed_rps = 5.0f,
+};
+
+
+
+
+bool profile_data_save() {
+    bool is_ok = eeprom_write(EEPROM_PROFILE_DATA_BASE_ADDR, (uint8_t *) &profile_data, sizeof(eeprom_profile_data_t));
+    if (!is_ok) {
+        printf("Unable to write to EEPROM at address %x\n", EEPROM_PROFILE_DATA_BASE_ADDR);
+        return false;
+    }
+
+    return true;
+}
+
+
+bool profile_data_init() {
+    bool is_ok = true;
+
+    // Create mutex for thread-safe PID parameter access
+    if (g_profile_pid_mutex == NULL) {
+        g_profile_pid_mutex = xSemaphoreCreateMutex();
+        if (g_profile_pid_mutex == NULL) {
+            printf("Profile: FATAL - Failed to create PID mutex!\n");
+            return false;
+        }
+    }
+
+    // Read profile index table
+    memset(&profile_data, 0x0, sizeof(eeprom_profile_data_t));
+    is_ok = eeprom_read(EEPROM_PROFILE_DATA_BASE_ADDR, (uint8_t *) &profile_data, sizeof(eeprom_profile_data_t));
+
+    bool need_defaults = false;
+    if (!is_ok) {
+        printf("Unable to read from EEPROM at address %x, using defaults\n", EEPROM_PROFILE_DATA_BASE_ADDR);
+        report_error(ERR_PROFILE_EEPROM_READ);
+        need_defaults = true;
+    } else {
+        // Ensure all profile names are null-terminated (EEPROM could contain garbage)
+        for (uint8_t idx = 0; idx < MAX_PROFILE_CNT; idx++) {
+            profile_data.profiles[idx].name[PROFILE_NAME_MAX_LEN - 1] = '\0';
+        }
+
+        // Bounds check: EEPROM could contain garbage index
+        if (profile_data.current_profile_idx >= MAX_PROFILE_CNT) {
+            profile_data.current_profile_idx = 0;
+        }
+
+        if (profile_data.profile_data_rev != EEPROM_PROFILE_DATA_REV) {
+            need_defaults = true;
+        }
+    }
+
+    if (need_defaults) {
+        profile_data.profile_data_rev = EEPROM_PROFILE_DATA_REV;
+        // Set default selected profile
+        profile_data.current_profile_idx = 0;
+
+        // Reset all profiles
+        memset(profile_data.profiles, 0x0, sizeof(profile_data.profiles));
+
+        // Copy four default profiles (from original developer)
+        memcpy(&profile_data.profiles[0], &default_ar_2208_profile, sizeof(profile_t));
+        memcpy(&profile_data.profiles[1], &default_ar_2209_profile, sizeof(profile_t));
+        memcpy(&profile_data.profiles[2], &default_8208xbr_profile, sizeof(profile_t));
+        memcpy(&profile_data.profiles[3], &default_benchmark2_profile, sizeof(profile_t));
+
+        // Update remaining profile slots with default names
+        for (uint8_t idx=4; idx < MAX_PROFILE_CNT; idx+=1) {
+            memcpy(&profile_data.profiles[idx], &default_generic_profile, sizeof(profile_t));
+            snprintf(profile_data.profiles[idx].name, PROFILE_NAME_MAX_LEN,
+                     "NewProfile%d", idx);
+        }
+
+        // Write back (may fail if no EEPROM)
+        if (is_ok && !profile_data_save()) {
+            report_error(ERR_PROFILE_EEPROM_WRITE);
+        }
+    }
+
+    // Register to eeprom save all
+    eeprom_register_handler(profile_data_save);
+
+    return true;
+}
+
+
+uint16_t profile_get_selected_idx() {
+    return profile_data.current_profile_idx;
+}
+
+
+profile_t * profile_get_selected() {
+    return &profile_data.profiles[profile_get_selected_idx()];
+}
+
+
+profile_t * profile_select(uint8_t idx) {
+    // Bounds check to prevent array overflow
+    if (idx >= MAX_PROFILE_CNT) {
+        report_error(ERR_PROFILE_EEPROM_READ);
+        return NULL;
+    }
+    profile_data.current_profile_idx = idx;
+
+    return profile_get_selected();
+}
+
+
+// Thread-safe read of PID parameters
+void profile_get_pid_params(float* coarse_kp, float* coarse_kd, float* fine_kp, float* fine_kd) {
+    profile_t* profile = profile_get_selected();
+
+    if (g_profile_pid_mutex != NULL) {
+        if (xSemaphoreTake(g_profile_pid_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            *coarse_kp = profile->coarse_kp;
+            *coarse_kd = profile->coarse_kd;
+            *fine_kp = profile->fine_kp;
+            *fine_kd = profile->fine_kd;
+            xSemaphoreGive(g_profile_pid_mutex);
+            return;
+        }
+    }
+
+    *coarse_kp = profile->coarse_kp;
+    *coarse_kd = profile->coarse_kd;
+    *fine_kp = profile->fine_kp;
+    *fine_kd = profile->fine_kd;
+}
+
+
+// Thread-safe write of PID parameters
+void profile_set_pid_params(float coarse_kp, float coarse_kd, float fine_kp, float fine_kd) {
+    profile_t* profile = profile_get_selected();
+
+    if (g_profile_pid_mutex != NULL) {
+        if (xSemaphoreTake(g_profile_pid_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            profile->coarse_kp = coarse_kp;
+            profile->coarse_kd = coarse_kd;
+            profile->fine_kp = fine_kp;
+            profile->fine_kd = fine_kd;
+            xSemaphoreGive(g_profile_pid_mutex);
+            return;
+        }
+    }
+
+    profile->coarse_kp = coarse_kp;
+    profile->coarse_kd = coarse_kd;
+    profile->fine_kp = fine_kp;
+    profile->fine_kd = fine_kd;
+}
+
+
+void profile_update_checksum() {
+    // NOTE: swuart_calcCRC overwrites the last byte of the datagram with CRC,
+    // which would corrupt the last byte of profile_t (fine_max_flow_speed_rps).
+    // This function is intentionally left as a no-op to prevent data corruption.
+    // A proper CRC field should be added to profile_t if checksum is needed.
+    (void)0;
+}
+
+bool http_rest_profile_config(struct fs_file *file, int num_params, char *params[], char *values[]) {
+    // Mappings:
+    // pf (int): profile index
+    // p0 (int): rev
+    // p1 (int): compatibility
+    // p2 (str): name
+    // p3 (float): coarse_kp
+    // p4 (float): coarse_ki
+    // p5 (float): coarse_kd
+    // p6 (float): coarse_min_flow_speed_rps
+    // p7 (float): coarse_max_flow_speed_rps
+    // p8 (float): fine_kp
+    // p9 (float): fine_ki
+    // p10 (float): fine_kd
+    // p11 (float): fine_min_flow_speed_rps
+    // p12 (float): fine_max_flow_speed_rps
+    // ee (bool): save to eeprom
+    static char buf[256];
+
+    // Read the current loaded profile index
+    uint8_t profile_idx = profile_get_selected_idx();
+
+    // Overwrite the profile index (if applicable)
+    for (int idx = 0; idx < num_params; idx += 1) {
+        if (strcmp(params[idx], "pf") == 0) {
+            int raw_idx = atoi(values[idx]);
+            if (raw_idx >= 0 && raw_idx < MAX_PROFILE_CNT) {
+                profile_idx = (uint8_t)raw_idx;
+            }
+        }
+    }
+
+    if (profile_idx >= MAX_PROFILE_CNT) {
+        snprintf(buf, sizeof(buf), "%s{\"error\":\"InvalidProfileIndex\"}", http_json_header);
+    }
+
+    else {
+        profile_t * current_profile = profile_select(profile_idx);
+        bool save_to_eeprom = false;
+
+        // Read current PID values first (we'll update and write back atomically)
+        float new_coarse_kp = current_profile->coarse_kp;
+        float new_coarse_kd = current_profile->coarse_kd;
+        float new_fine_kp = current_profile->fine_kp;
+        float new_fine_kd = current_profile->fine_kd;
+        bool pid_changed = false;
+
+        // Control
+        for (int idx = 0; idx < num_params; idx += 1) {
+            if (strcmp(params[idx], "p0") == 0) {
+                current_profile->rev = strtol(values[idx], NULL, 10);
+            }
+            else if (strcmp(params[idx], "p1") == 0) {
+                current_profile->compatibility = strtol(values[idx], NULL, 10);
+            }
+            else if (strcmp(params[idx], "p2") == 0) {
+                strncpy(current_profile->name, values[idx], sizeof(current_profile->name) - 1);
+                current_profile->name[sizeof(current_profile->name) - 1] = '\0';
+            }
+            else if (strcmp(params[idx], "p3") == 0) {
+                new_coarse_kp = strtof_locale(values[idx]);
+                pid_changed = true;
+            }
+            else if (strcmp(params[idx], "p4") == 0) {
+                current_profile->coarse_ki = strtof_locale(values[idx]);
+            }
+            else if (strcmp(params[idx], "p5") == 0) {
+                new_coarse_kd = strtof_locale(values[idx]);
+                pid_changed = true;
+            }
+            else if (strcmp(params[idx], "p6") == 0) {
+                current_profile->coarse_min_flow_speed_rps = strtof_locale(values[idx]);
+            }
+            else if (strcmp(params[idx], "p7") == 0) {
+                current_profile->coarse_max_flow_speed_rps = strtof_locale(values[idx]);
+            }
+            else if (strcmp(params[idx], "p8") == 0) {
+                new_fine_kp = strtof_locale(values[idx]);
+                pid_changed = true;
+            }
+            else if (strcmp(params[idx], "p9") == 0) {
+                current_profile->fine_ki = strtof_locale(values[idx]);
+            }
+            else if (strcmp(params[idx], "p10") == 0) {
+                new_fine_kd = strtof_locale(values[idx]);
+                pid_changed = true;
+            }
+            else if (strcmp(params[idx], "p11") == 0) {
+                current_profile->fine_min_flow_speed_rps = strtof_locale(values[idx]);
+            }
+            else if (strcmp(params[idx], "p12") == 0) {
+                current_profile->fine_max_flow_speed_rps = strtof_locale(values[idx]);
+            }
+            else if (strcmp(params[idx], "ee") == 0) {
+                save_to_eeprom = string_to_boolean(values[idx]);
+            }
+        }
+
+        // Write PID values atomically using mutex-protected function
+        if (pid_changed) {
+            profile_set_pid_params(new_coarse_kp, new_coarse_kd, new_fine_kp, new_fine_kd);
+        }
+
+        // Perform action
+        if (save_to_eeprom) {
+            profile_data_save();
+        }
+
+        // Response
+        snprintf(buf, sizeof(buf), 
+                 "%s"
+                 "{\"pf\":%d,\"p0\":%ld,\"p1\":%ld,\"p2\":\"%s\",\"p3\":%0.3f,\"p4\":%0.3f,\"p5\":%0.3f,\"p6\":%0.3f,\"p7\":%0.3f,\"p8\":%0.3f,\"p9\":%0.3f,\"p10\":%0.3f,\"p11\":%0.3f,\"p12\":%0.3f}",
+                 http_json_header,
+                 profile_idx, 
+                 current_profile->rev,
+                 current_profile->compatibility,
+                 current_profile->name,
+                 current_profile->coarse_kp,
+                 current_profile->coarse_ki,
+                 current_profile->coarse_kd,
+                 current_profile->coarse_min_flow_speed_rps,
+                 current_profile->coarse_max_flow_speed_rps,
+                 current_profile->fine_kp,
+                 current_profile->fine_ki,
+                 current_profile->fine_kd,
+                 current_profile->fine_min_flow_speed_rps,
+                 current_profile->fine_max_flow_speed_rps);
+    }
+
+    size_t response_len = strlen(buf);
+    file->data = buf;
+    file->len = response_len;
+    file->index = response_len;
+    file->flags = FS_FILE_FLAGS_HEADER_INCLUDED;
+
+    return true;
+}
+
+
+bool profile_reset_defaults(void) {
+    memset(profile_data.profiles, 0x0, sizeof(profile_data.profiles));
+
+    memcpy(&profile_data.profiles[0], &default_ar_2208_profile, sizeof(profile_t));
+    memcpy(&profile_data.profiles[1], &default_ar_2209_profile, sizeof(profile_t));
+    memcpy(&profile_data.profiles[2], &default_8208xbr_profile, sizeof(profile_t));
+    memcpy(&profile_data.profiles[3], &default_benchmark2_profile, sizeof(profile_t));
+
+    for (uint8_t idx = 4; idx < MAX_PROFILE_CNT; idx += 1) {
+        memcpy(&profile_data.profiles[idx], &default_generic_profile, sizeof(profile_t));
+        snprintf(profile_data.profiles[idx].name, PROFILE_NAME_MAX_LEN,
+                 "NewProfile%d", idx);
+    }
+
+    profile_data.current_profile_idx = 0;
+    return profile_data_save();
+}
+
+
+bool profile_reset_one(uint8_t idx) {
+    if (idx >= MAX_PROFILE_CNT) return false;
+
+    memcpy(&profile_data.profiles[idx], &default_generic_profile, sizeof(profile_t));
+    snprintf(profile_data.profiles[idx].name, PROFILE_NAME_MAX_LEN, "NewProfile%d", idx);
+
+    printf("Profile reset #%d: name=%s, coarse_kp=%.3f, fine_kp=%.3f\n",
+           idx, profile_data.profiles[idx].name,
+           profile_data.profiles[idx].coarse_kp,
+           profile_data.profiles[idx].fine_kp);
+
+    return profile_data_save();
+}
+
+
+bool http_rest_profile_reset(struct fs_file *file, int num_params, char *params[], char *values[]) {
+    static char buf[128];
+    bool success;
+
+    int target_idx = -1;
+    for (int idx = 0; idx < num_params; idx += 1) {
+        if (strcmp(params[idx], "pf") == 0) {
+            target_idx = atoi(values[idx]);
+        }
+    }
+
+    if (target_idx >= 0 && target_idx < MAX_PROFILE_CNT) {
+        success = profile_reset_one((uint8_t) target_idx);
+    } else {
+        success = profile_reset_defaults();
+    }
+
+    snprintf(buf, sizeof(buf),
+             "%s{\"success\":%s}",
+             http_json_header,
+             success ? "true" : "false");
+
+    size_t len = strlen(buf);
+    file->data = buf;
+    file->len = len;
+    file->index = len;
+    file->flags = FS_FILE_FLAGS_HEADER_INCLUDED;
+
+    return true;
+}
+
+
+bool http_rest_profile_summary(struct fs_file *file, int num_params, char *params[], char *values[])
+{
+    // It does not take argument
+    // Buffer: HTTP header (~50) + {"s0":{ + 8 profiles * ~30 chars each + closing
+    static char buf[512];
+
+    // Response
+    // s0 (dict): A dictionary of all profiles in {idx: name} format.
+    // s1 (int): The current loaded profile index
+
+    int len = snprintf(buf, sizeof(buf),
+             "%s{\"s0\":{",
+             http_json_header);
+
+    // Write profile information
+    for (uint8_t p_idx = 0; p_idx < MAX_PROFILE_CNT; p_idx++) {
+        if (len >= (int)sizeof(buf) - 1) break;
+        len += snprintf(&buf[len], sizeof(buf) - len,
+                 "\"%d\":\"%s\",",
+                 p_idx, profile_data.profiles[p_idx].name);
+    }
+
+    // Replace trailing comma with close brace
+    if (len > 0 && buf[len - 1] == ',') {
+        buf[len - 1] = '}';
+    }
+
+    // Append s1
+    len += snprintf(&buf[len], sizeof(buf) - len,
+             ",\"s1\":%d}",
+             profile_data.current_profile_idx);
+
+    if (len >= (int)sizeof(buf)) {
+        len = (int)sizeof(buf) - 1;
+    }
+
+    file->data = buf;
+    file->len = len;
+    file->index = len;
+    file->flags = FS_FILE_FLAGS_HEADER_INCLUDED;
+
+    return true;
+}
