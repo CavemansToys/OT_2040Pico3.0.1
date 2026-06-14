@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.25)
 
 # Set project data
 set(PROJECT_NAME "OpenTricklerController")
-set(TARGET_NAME "OpenTrickler_2.9.0")
+set(TARGET_NAME "OpenTrickler_3.0.1")
 
 message("CMAKE_SOURCE_DIR: ${CMAKE_SOURCE_DIR}")
 

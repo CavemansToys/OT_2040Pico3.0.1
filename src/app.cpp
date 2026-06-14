@@ -1,5 +1,5 @@
 /*
- * OpenTrickler v2.9.0 RP2040 - Full firmware with WiFi
+ * OpenTrickler 3.0.1 RP2040 - Full firmware with WiFi
  */
 
 #include <FreeRTOS.h>
@@ -161,7 +161,7 @@ int main()
     stdio_init_all();
     error_system_init();
 
-    printf("\n=== OpenTrickler v2.9.0 RP2040 ===\n");
+    printf("\n=== OpenTrickler 3.0.1 RP2040 ===\n");
 
     // REST app control init (creates the REST event queue)
     if (!rest_app_control_init()) {

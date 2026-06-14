@@ -1,4 +1,4 @@
-# OpenTrickler Controller (RP2040) — OpenTrickler 2.9.0
+# OT_2040Pico3.0.1 — OpenTrickler Controller
 
 Firmware for the [OpenTrickler](https://github.com/eamars/OpenTrickler-RP2040-Controller) automated powder trickler, used in precision ammunition reloading. Runs on a **Raspberry Pi Pico W (RP2040)** with FreeRTOS SMP, WiFi, and multiple hardware peripherals.
 
@@ -31,8 +31,8 @@ Based on [OpenTrickler-RP2040-Controller](https://github.com/eamars/OpenTrickler
 
 ```bash
 # Clone with submodules
-git clone --recursive https://github.com/<your-org>/OpenTrickler.git
-cd OpenTrickler
+git clone --recursive https://github.com/CavemansToys/OT_2040Pico3.0.1.git
+cd OT_2040Pico3.0.1
 
 # If you forgot --recursive:
 git submodule update --init --recursive
@@ -45,16 +45,16 @@ ninja
 ## Flashing
 
 1. Hold **BOOTSEL** while plugging the Pico into USB
-2. Copy `build/OpenTrickler_2.9.0.uf2` to the Pico mass storage device
+2. Copy `build/OpenTrickler_3.0.1.uf2` to the Pico mass storage device
 3. The Pico reboots automatically
 
 ## Output Artifacts
 
 | File | Description |
 |---|---|
-| `build/OpenTrickler_2.9.0.uf2` | Flashable firmware (drag-and-drop) |
-| `build/OpenTrickler_2.9.0.elf` | For GDB debugging |
-| `build/OpenTrickler_2.9.0.bin` | Binary image |
+| `build/OpenTrickler_3.0.1.uf2` | Flashable firmware (drag-and-drop) |
+| `build/OpenTrickler_3.0.1.elf` | For GDB debugging |
+| `build/OpenTrickler_3.0.1.bin` | Binary image |
 
 ## Debugging
 
